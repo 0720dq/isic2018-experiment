@@ -168,11 +168,11 @@ def grid_partition(
         grid (torch.Tensor): Unfolded input tensor of the shape [B * grids, grid_size[0], grid_size[1], C].
     """
     # Get size of input
-    B, C, H, W = input.shape
+    B, C, H, W = input.shape  # [1, 32, 256, 256]
     # Unfold input
     grid = input.view(B, C, grid_size[0], H // grid_size[0], grid_size[1], W // grid_size[1])
     # Permute and reshape [B * (H // grid_size[0]) * (W // grid_size[1]), grid_size[0], window_size[1], C]
-    grid = grid.permute(0, 3, 5, 2, 4, 1).contiguous().view(-1, grid_size[0], grid_size[1], C)
+    grid = grid.permute(0, 3, 5, 2, 4, 1).contiguous().view(-1, grid_size[0], grid_size[1], C)  # [1024, 8, 8, 32]
     return grid
 
 
@@ -192,12 +192,12 @@ def grid_reverse(
         output (torch.Tensor): Folded output tensor of the shape [B, C, original_size[0], original_size[1]].
     """
     # Get height, width, and channels
-    (H, W), C = original_size, grid.shape[-1]
+    (H, W), C = original_size, grid.shape[-1]  # grid.shape:[1024, 64, 32]
     # Compute original batch size
     B = int(grid.shape[0] / (H * W / grid_size[0] / grid_size[1]))
     # Fold grid tensor
     output = grid.view(B, H // grid_size[0], W // grid_size[1], grid_size[0], grid_size[1], C)
-    output = output.permute(0, 5, 3, 1, 4, 2).contiguous().view(B, C, H, W)
+    output = output.permute(0, 5, 3, 1, 4, 2).contiguous().view(B, C, H, W)  # [1, 32, 256, 256]
     return output
 
 
@@ -295,19 +295,19 @@ class RelativeSelfAttention(nn.Module):
             output (torch.Tensor): Output tensor of the shape [B_, N, C].
         """
         # Get shape of input
-        B_, N, C = input.shape
+        B_, N, C = input.shape  # [1024, 64, 32]
         # Perform query key value mapping
-        qkv = self.qkv_mapping(input).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+        qkv = self.qkv_mapping(input).reshape(B_, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)  # [3, 1024, 32, 64, 1]
+        q, k, v = qkv.unbind(0)  # [1024, 32, 64, 1]
         # Scale query
         q = q * self.scale
         # Compute attention maps
-        attn = self.softmax(q @ k.transpose(-2, -1) + self._get_relative_positional_bias())
+        attn = self.softmax(q @ k.transpose(-2, -1) + self._get_relative_positional_bias())  # [1024, 32, 64, 64]
         # Map value with attention maps
-        output = (attn @ v).transpose(1, 2).reshape(B_, N, -1)
+        output = (attn @ v).transpose(1, 2).reshape(B_, N, -1)  # [1024, 64, 32]
         # Perform final projection and dropout
-        output = self.proj(output)
-        output = self.proj_drop(output)
+        output = self.proj(output)  # [1024, 64, 32]
+        output = self.proj_drop(output)  # [1024, 64, 32]
         return output
 
 
@@ -389,8 +389,8 @@ class MaxViTTransformerBlock(nn.Module):
         # Save original shape
         B, C, H, W = input.shape
         # Perform partition
-        input_partitioned = self.partition_function(input, self.grid_window_size)
-        input_partitioned = input_partitioned.view(-1, self.grid_window_size[0] * self.grid_window_size[1], C)
+        input_partitioned = self.partition_function(input, self.grid_window_size)  # [1024, 8, 8, 32]
+        input_partitioned = input_partitioned.view(-1, self.grid_window_size[0] * self.grid_window_size[1], C)  # [1024, 64, 32]
         # Perform normalization, attention, and dropout
         output = input_partitioned + self.drop_path(self.attention(self.norm_1(input_partitioned)))
         # Perform normalization, MLP, and dropout
@@ -753,7 +753,7 @@ if __name__ == '__main__':
         )
     device = torch.device('cuda:0')
     ras = ras.to(device=device)
-    input_tensor = torch.randn(4, 16, 512, 512)
+    input_tensor = torch.randn(1, 16, 512, 512)
     input_tensor = input_tensor.to(device, dtype=torch.float)
 
     out = ras(input_tensor)

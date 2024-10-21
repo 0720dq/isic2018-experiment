@@ -76,8 +76,8 @@ def get_seqlen_and_mask(input_resolution, window_size, device):
     return attn_local_length, attn_mask
 
 
-class AggregatedAttention(nn.Module):
-    def __init__(self, dim, input_resolution, num_heads=8, window_size=3, qkv_bias=True,
+class AggregatedAttention_dwconv(nn.Module):
+    def __init__(self, dim, input_resolution, dw_k, dw_p, num_heads=8, window_size=3, qkv_bias=True,
                  attn_drop=0., proj_drop=0., sr_ratio=1, is_extrapolation=False):
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
@@ -114,6 +114,8 @@ class AggregatedAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
+        self.depthwise = nn.Conv2d(dim, dim, kernel_size=dw_k, stride=sr_ratio, padding=dw_p, groups=dim)
+        self.pointwise = nn.Conv2d(dim, dim, kernel_size=1)
         self.sr = nn.Conv2d(dim, dim, kernel_size=1, stride=1, padding=0)
         self.norm = nn.LayerNorm(dim)
         self.act = nn.GELU()
@@ -134,33 +136,34 @@ class AggregatedAttention(nn.Module):
         self.learnable_bias = nn.Parameter(torch.zeros(num_heads, 1, self.local_len))
 
     def forward(self, x, H, W, relative_pos_index, relative_coords_table, seq_length_scale, padding_mask):
-        B, N, C = x.shape  # [1, 16384, 16]
+        B, N, C = x.shape
         pool_H, pool_W = H // self.sr_ratio, W // self.sr_ratio
-        pool_len = pool_H * pool_W  # 256
+        pool_len = pool_H * pool_W
 
         # Generate queries, normalize them with L2, add query embedding, and then magnify with sequence length scale and temperature.
         # Use softplus function ensuring that the temperature is not lower than 0.
-        q_norm = F.normalize(self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3), dim=-1)  # [1, 4, 16384, 4]
-        q_norm_scaled = (q_norm + self.query_embedding) * F.softplus(self.temperature) * seq_length_scale  # [1, 4, 16384, 4]
+        q_norm = F.normalize(self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3), dim=-1)
+        q_norm_scaled = (q_norm + self.query_embedding) * F.softplus(self.temperature) * seq_length_scale
 
         # Generate unfolded keys and values and l2-normalize them
-        k_local, v_local = self.kv(x).chunk(2, dim=-1)  # [1, 16384, 16]
-        k_local = F.normalize(k_local.reshape(B, N, self.num_heads, self.head_dim), dim=-1).reshape(B, N, -1)  # [1, 4, 16384, 4]
+        k_local, v_local = self.kv(x).chunk(2, dim=-1)
+        k_local = F.normalize(k_local.reshape(B, N, self.num_heads, self.head_dim), dim=-1).reshape(B, N, -1)
         kv_local = torch.cat([k_local, v_local], dim=-1).permute(0, 2, 1).reshape(B, -1, H, W)
         k_local, v_local = self.unfold(kv_local).reshape(
             B, 2 * self.num_heads, self.head_dim, self.local_len, N).permute(0, 1, 4, 2, 3).chunk(2, dim=1)
         # Compute local similarity
         attn_local = ((q_norm_scaled.unsqueeze(-2) @ k_local).squeeze(-2) \
-                      + self.relative_pos_bias_local.unsqueeze(1)).masked_fill(padding_mask, float('-inf'))  # [1, 4, 16384, 9]
+                      + self.relative_pos_bias_local.unsqueeze(1)).masked_fill(padding_mask, float('-inf'))
 
         # Generate pooled features
         x_ = x.permute(0, 2, 1).reshape(B, -1, H, W).contiguous()  # [1, 16, 128, 128]
-        x_ = F.adaptive_avg_pool2d(self.act(self.sr(x_)), (pool_H, pool_W)).reshape(B, -1, pool_len).permute(0, 2, 1)
-        x_ = self.norm(x_)
+        x_ = self.pointwise(self.depthwise(self.act(self.sr(x_)))).reshape(B, -1, pool_len).permute(0, 2,
+                                                                                                    1)  # [1, 256, 16]
+        x_ = self.norm(x_)  # [1, 256, 16]
 
         # Generate pooled keys and values
-        kv_pool = self.kv(x_).reshape(B, pool_len, 2 * self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # [1, 8, 256, 4]
-        k_pool, v_pool = kv_pool.chunk(2, dim=1)  # [1, 4, 256, 4]
+        kv_pool = self.kv(x_).reshape(B, pool_len, 2 * self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k_pool, v_pool = kv_pool.chunk(2, dim=1)
 
         if self.is_extrapolation:
             ##Use MLP to generate continuous relative positional bias for pooled features.
@@ -180,36 +183,37 @@ class AggregatedAttention(nn.Module):
             pool_bias = F.interpolate(pool_bias, (H, W), mode='bilinear').reshape(-1, pool_len, N).transpose(-1, -2)
 
         # Compute pooled similarity
-        attn_pool = q_norm_scaled @ F.normalize(k_pool, dim=-1).transpose(-2, -1) + pool_bias  # [1, 4, 16384, 256]
+        attn_pool = q_norm_scaled @ F.normalize(k_pool, dim=-1).transpose(-2, -1) + pool_bias
 
         # Concatenate local & pooled similarity matrices and calculate attention weights through the same Softmax
-        attn = torch.cat([attn_local, attn_pool], dim=-1).softmax(dim=-1)  # [1, 4, 16384, 265]
-        attn = self.attn_drop(attn)  # [1, 4, 16384, 265]
+        attn = torch.cat([attn_local, attn_pool], dim=-1).softmax(dim=-1)
+        attn = self.attn_drop(attn)
 
         # Split the attention weights and separately aggregate the values of local & pooled features
         attn_local, attn_pool = torch.split(attn, [self.local_len, pool_len], dim=-1)
         x_local = (((q_norm @ self.learnable_tokens) + self.learnable_bias + attn_local).unsqueeze(
-            -2) @ v_local.transpose(-2, -1)).squeeze(-2)  # [1, 4, 16384, 4]
-        x_pool = attn_pool @ v_pool  # [1, 4, 16384, 4]
-
+            -2) @ v_local.transpose(-2, -1)).squeeze(-2)
+        x_pool = attn_pool @ v_pool
         x = (x_local + x_pool).transpose(1, 2).reshape(B, N, C)
 
         x = self.proj(x)
-        x = self.proj_drop(x)  # [1, 16384, 16]
+        x = self.proj_drop(x)
 
         return x
 
 
 class Block(nn.Module):
 
-    def __init__(self, dim, num_heads, input_resolution, window_size=3, mlp_ratio=4.,
+    def __init__(self, dim, num_heads, input_resolution, dw_k, dw_p,window_size=3, mlp_ratio=4.,
                  qkv_bias=False, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, sr_ratio=1, is_extrapolation=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = AggregatedAttention(
+        self.attn = AggregatedAttention_dwconv(
             dim,
             input_resolution,
+            dw_k,
+            dw_p,
             window_size=window_size,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
@@ -255,9 +259,9 @@ class OverlapPatchEmbed(nn.Module):
         return x, H, W
 
 
-class AAEcoder(nn.Module):
+class AAdwconvEcoder(nn.Module):
 
-    def __init__(self, in_chans, embed_dims, input_resolution, out_resolution, num_heads, mlp_ratio, sr_ratio, drop_path, pretrain_size=224, i=0,
+    def __init__(self, in_chans, embed_dims, input_resolution, out_resolution, num_heads, mlp_ratio, sr_ratio, drop_path, depth, dw_k, dw_p, pretrain_size=224, i=0,
                  window_size=3, patch_size=3, drop_rate=0., attn_drop_rate=0., norm_layer=nn.LayerNorm, qkv_bias=True, is_extrapolation=False):
         super().__init__()
         self.is_extrapolation = is_extrapolation
@@ -270,11 +274,17 @@ class AAEcoder(nn.Module):
                                              stride=2,
                                              in_chans=in_chans,
                                              embed_dim=embed_dims)
-        self.block = Block(
-                dim=embed_dims, input_resolution=out_resolution, window_size=window_size,
+        # self.block = Block(
+        #         dim=embed_dims, input_resolution=out_resolution, window_size=window_size,
+        #         num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+        #         drop=drop_rate, attn_drop=attn_drop_rate, drop_path=drop_path, norm_layer=norm_layer,
+        #         sr_ratio=sr_ratio, is_extrapolation=is_extrapolation)
+        self.block = nn.ModuleList([Block(
+                dim=embed_dims, input_resolution=out_resolution, dw_k=dw_k, dw_p=dw_p, window_size=window_size,
                 num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=drop_path, norm_layer=norm_layer,
                 sr_ratio=sr_ratio, is_extrapolation=is_extrapolation)
+                for i in range(depth)])
         self.norm = norm_layer(embed_dims)
 
         if not self.is_extrapolation:
@@ -305,7 +315,8 @@ class AAEcoder(nn.Module):
             local_seq_length, padding_mask = get_seqlen_and_mask((H, W), self.window_size, device=x.device)
             seq_length_scale = torch.log(local_seq_length + (H // self.sr_ratio) * (W // self.sr_ratio))
 
-        x = self.block(x, H, W, relative_pos_index, relative_coords_table, seq_length_scale, padding_mask)
+        for blk in self.block:
+            x = blk(x, H, W, relative_pos_index, relative_coords_table, seq_length_scale, padding_mask)
         x = self.norm(x)
         x = x.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
 
@@ -313,8 +324,8 @@ class AAEcoder(nn.Module):
 
 
 if __name__ == '__main__':
-    model = AAEcoder(in_chans=3, embed_dims=16, input_resolution=(256, 256), out_resolution=(128, 128),
-                     num_heads=4, mlp_ratio=8, sr_ratio=8, drop_path=0.2)
+    model = AAdwconvEcoder(in_chans=3, embed_dims=16, input_resolution=(256, 256), out_resolution=(128, 128),
+                     num_heads=4, mlp_ratio=8, sr_ratio=8, drop_path=0.2, depth=1, dw_k=21, dw_p=7)
     device = torch.device('cuda:0')
     model = model.to(device=device)
     input_tensor = torch.randn(1, 3, 256, 256)
